@@ -1,7 +1,4 @@
-"""Contract test: the s6-overlay stage2 hook re-chowns the build trees under
-$INSTALL_DIR (/opt/hermes/.venv, ui-tui, node_modules) to the runtime hermes
-UID whenever they are not already hermes-owned — INDEPENDENTLY of whether
-$HERMES_HOME ownership already matches.
+"""Contract test: the s6-overlay stage2 hook keeps build trees writable.
 
 Regression guard for the HERMES_UID/PUID remap path broken by #35027.
 
@@ -13,7 +10,11 @@ already satisfied and the build-tree chown was silently skipped — leaving
   - lazy_deps.py `uv pip install` of platform extras (#15012, #21100)
   - the TUI esbuild rebuild into ui-tui/dist (#28851)
 
-The fix probes the build trees directly (stat .venv) rather than $HERMES_HOME.
+The current fix avoids a startup-scale `chown -R` over the full .venv and
+node_modules trees. New Docker layers make those trees group-writable; stage2
+recreates the old build GID as a supplemental group for hermes after GID remap,
+then only falls back to directory-owner repair when the trees still are not
+writable.
 
 The extraction + stubbed-shell-run approach mirrors
 tests/tools/test_stage2_hook_toplevel_chown.py.
@@ -39,84 +40,123 @@ def stage2_text() -> str:
     return STAGE2_HOOK.read_text()
 
 
-def _build_tree_block(text: str) -> str:
-    """Extract the build-tree chown block: from the `venv_owner=` probe
-    through the closing `fi` of the chown."""
+def _build_tree_repair_block(text: str) -> str:
+    """Extract the build-tree repair block."""
     m = re.search(
-        r"(venv_owner=\$\(stat[^\n]*\n(?:.*\n)*?fi)",
+        r"(ensure_install_tree_group\(\) \{\n(?:.*\n)*?^done)",
         text,
+        flags=re.MULTILINE,
     )
-    assert m, "stage2-hook.sh must contain the venv_owner-gated build-tree chown block"
+    assert m, "stage2-hook.sh must contain the build-tree writability repair block"
     return m.group(1)
 
 
-def test_build_tree_chown_not_gated_on_hermes_home(stage2_text: str) -> None:
-    """The build-tree chown must NOT live inside the `if [ "$needs_chown" = true ]`
+def test_build_tree_repair_not_gated_on_hermes_home(stage2_text: str) -> None:
+    """The build-tree repair must NOT live inside the `if [ "$needs_chown" = true ]`
     block keyed on $HERMES_HOME ownership — that is exactly the #35027 bug."""
-    block = _build_tree_block(stage2_text)
-    # The block probes the venv owner, not $HERMES_HOME.
-    assert "venv_owner" in block
-    assert "$INSTALL_DIR/.venv" in block
-    # All three build trees are covered.
-    for tree in ("$INSTALL_DIR/.venv", "$INSTALL_DIR/ui-tui", "$INSTALL_DIR/node_modules"):
-        assert tree in block, f"build-tree chown must cover {tree}"
+    block = _build_tree_repair_block(stage2_text)
+    assert "$HERMES_HOME" not in block
+    assert "as_hermes test -w" in block
+    # All runtime-writable build trees are covered independently.
+    for tree in (
+        "$INSTALL_DIR/.venv",
+        "$INSTALL_DIR/ui-tui",
+        "$INSTALL_DIR/gateway",
+        "$INSTALL_DIR/node_modules",
+    ):
+        assert tree in block, f"build-tree repair must cover {tree}"
+    assert "chown -R hermes:hermes" not in block
 
 
-def _run_build_tree_block(
-    text: str, *, venv_owner: int, hermes_uid: int
-) -> bool:
-    """Run the extracted build-tree block with `stat`, `id`, and `chown`
-    stubbed. Returns True iff the block attempted the recursive chown."""
+def _run_build_tree_repair_block(
+    text: str,
+    *,
+    tree_gid: int,
+    hermes_uid: int = 4242,
+    hermes_gid: int = 4243,
+    writable_as_hermes: bool,
+) -> list[str]:
+    """Run the extracted block with external commands stubbed."""
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash not available")
-    block = _build_tree_block(text)
+    block = _build_tree_repair_block(text)
 
     with tempfile.TemporaryDirectory() as d:
         dpath = Path(d)
         log = dpath / "chown.log"
-        # Stubs:
-        #   stat -c %u <path>  -> echo the simulated venv owner
-        #   id -u hermes       -> handled via actual_hermes_uid var below
-        #   chown ...          -> record that it fired
+        install_dir = dpath / "install"
+        for rel in (".venv", "ui-tui", "gateway", "node_modules"):
+            (install_dir / rel).mkdir(parents=True)
+
+        writable = "0" if writable_as_hermes else "1"
         script = (
             "set -eu\n"
-            f'INSTALL_DIR="/opt/hermes"\n'
+            f'INSTALL_DIR="{install_dir}"\n'
             f'actual_hermes_uid={hermes_uid}\n'
-            f'stat() {{ echo {venv_owner}; }}\n'
-            f'chown() {{ echo fired >> "{log}"; }}\n'
+            f'actual_hermes_gid={hermes_gid}\n'
+            "stat() { echo "
+            f"{tree_gid}"
+            "; }\n"
+            "id() {\n"
+            "  if [ \"$1\" = \"-G\" ]; then echo \"4243\"; return 0; fi\n"
+            "  if [ \"$1\" = \"-g\" ]; then echo \"$actual_hermes_gid\"; return 0; fi\n"
+            "  if [ \"$1\" = \"-u\" ]; then echo \"$actual_hermes_uid\"; return 0; fi\n"
+            "  return 1\n"
+            "}\n"
+            "getent() { return 2; }\n"
+            f'groupadd() {{ echo "groupadd $*" >> "{log}"; }}\n'
+            f'usermod() {{ echo "usermod $*" >> "{log}"; }}\n'
+            f'chown() {{ echo "chown $*" >> "{log}"; }}\n'
+            f'find() {{ echo "find $*" >> "{log}"; }}\n'
+            f'as_hermes() {{ return {writable}; }}\n'
             + block
         )
         script_path = dpath / "harness.sh"
         script_path.write_text(script)
         proc = subprocess.run([bash, str(script_path)], capture_output=True, text=True)
         assert proc.returncode == 0, proc.stderr
-        return log.exists() and "fired" in log.read_text()
+        return log.read_text().splitlines() if log.exists() else []
 
 
-def test_chown_fires_when_venv_owner_differs(stage2_text: str) -> None:
+def test_build_gid_group_is_granted_when_tree_gid_differs(stage2_text: str) -> None:
     """The #35027 regression scenario: after a remap $HERMES_HOME already
-    matches the new UID, but the venv is still owned by the build-time UID
-    (10000). The build-tree chown MUST still fire."""
-    fired = _run_build_tree_block(stage2_text, venv_owner=10000, hermes_uid=4242)
-    assert fired, (
-        "build-tree chown must fire when the venv is not owned by the runtime "
-        "hermes UID, regardless of $HERMES_HOME ownership (#35027 regression)"
+    matches the new UID, but install trees still carry the build-time GID
+    (10000). Stage2 must grant hermes that GID independently of $HERMES_HOME."""
+    lines = _run_build_tree_repair_block(
+        stage2_text,
+        tree_gid=10000,
+        hermes_gid=4243,
+        writable_as_hermes=True,
+    )
+    assert any(line == "groupadd -g 10000 hermesbuild" for line in lines)
+    assert any(line == "usermod -aG hermesbuild hermes" for line in lines)
+    assert not any(line.startswith("chown ") for line in lines), (
+        "group-writable build trees should not need startup chown"
     )
 
 
-def test_chown_skipped_when_venv_already_owned(stage2_text: str) -> None:
-    """Idempotency: once the venv is hermes-owned, the recursive chown is
-    skipped on subsequent boots."""
-    fired = _run_build_tree_block(stage2_text, venv_owner=4242, hermes_uid=4242)
-    assert not fired, (
-        "build-tree chown must be skipped when the venv already matches the "
-        "runtime hermes UID (avoid expensive recursive chown on every restart)"
+def test_directory_chown_fallback_when_group_write_is_insufficient(stage2_text: str) -> None:
+    """If group membership does not make a tree writable, repair directories
+    rather than recursively chowning every dependency file."""
+    lines = _run_build_tree_repair_block(
+        stage2_text,
+        tree_gid=10000,
+        hermes_gid=4243,
+        writable_as_hermes=False,
     )
+    assert any(line.startswith("chown hermes:hermes ") for line in lines)
+    assert any(" -type d " in f" {line} " for line in lines)
+    assert not any(line.startswith("chown -R ") for line in lines)
 
 
-def test_chown_skipped_for_default_uid(stage2_text: str) -> None:
-    """No remap: venv owned by the default build UID (10000) and hermes is
-    still 10000 — nothing to do."""
-    fired = _run_build_tree_block(stage2_text, venv_owner=10000, hermes_uid=10000)
-    assert not fired
+def test_group_grant_skipped_when_tree_gid_already_matches(stage2_text: str) -> None:
+    """No remap: tree GID and hermes GID already match."""
+    lines = _run_build_tree_repair_block(
+        stage2_text,
+        tree_gid=10000,
+        hermes_gid=10000,
+        writable_as_hermes=True,
+    )
+    assert not any(line.startswith(("groupadd ", "usermod ", "chown ", "find ")) for line in lines)
+

@@ -181,6 +181,7 @@ done
 # The canonical list of hermes-owned subdirs is the same one the s6-setuidgid
 # mkdir -p block below seeds. Keep them in sync if the seed list changes.
 actual_hermes_uid=$(id -u hermes)
+actual_hermes_gid=$(id -g hermes)
 needs_chown=false
 if [ "$(stat -c %u "$HERMES_HOME" 2>/dev/null)" != "$actual_hermes_uid" ]; then
     needs_chown=true
@@ -207,49 +208,90 @@ if [ "$needs_chown" = true ]; then
     done
 fi
 
-# --- Fix ownership of build trees under $INSTALL_DIR ---
-# Hermes-owned trees under $INSTALL_DIR must be re-chowned whenever the
-# runtime hermes UID no longer owns them — otherwise:
+# --- Ensure build trees under $INSTALL_DIR stay writable after UID/GID remap ---
+# Runtime-writable trees under $INSTALL_DIR must remain writable after the
+# hermes UID/GID is remapped, otherwise:
 #   - .venv: lazy_deps.py cannot install platform packages (discord.py,
 #     telegram, slack, etc.) with EACCES (#15012, #21100)
-#   - ui-tui: esbuild rebuilds dist/entry.js on every TUI launch (when
-#     the source mtime is newer than dist/ or when HERMES_TUI_FORCE_BUILD
-#     is set) and writes to ui-tui/dist/. Without this chown the new
-#     hermes UID can't write the build output (#28851).
+#   - ui-tui: local/non-packaged TUI launches may rebuild dist/entry.js
+#     (#28851). Published Docker images normally use HERMES_TUI_DIR and the
+#     prebuilt bundle, so this is a fallback surface rather than the hot path.
 #   - gateway: Python writes __pycache__ and runtime artifacts beneath the
-#     gateway package on first import. After a UID remap those source-owned
-#     paths still belong to the build-time UID (10000) unless repaired here,
-#     producing EACCES for the supervised gateway (#27221).
-#   - node_modules: root-level dependencies (puppeteer, web tooling)
-#     that runtime code may walk/update.
-# The set mirrors the build-time `chown -R hermes:hermes` line in the
-# Dockerfile — keep them in sync if the Dockerfile chown set changes.
-# These are under $INSTALL_DIR (not $HERMES_HOME), so the bind-mount
-# concern doesn't apply — recursive is fine.
+#     gateway package on first import (#27221).
+#   - node_modules: root-level dependencies (agent-browser/web tooling)
+#     that opt-in setup flows may update.
 #
-# This MUST be gated independently of the $HERMES_HOME ownership check
-# above. `usermod -u <new> hermes` re-chowns the hermes home dir
-# ($HERMES_HOME == /opt/data) to the new UID as a side effect, so after a
-# HERMES_UID/PUID remap `stat $HERMES_HOME` always already matches the new
-# UID and `needs_chown` is false — but the build trees under /opt/hermes
-# are NOT touched by usermod and remain owned by the build-time UID
-# (10000). Gating them on $HERMES_HOME ownership (as #35027 did) silently
-# skipped this chown on the common PUID/NAS path, regressing lazy installs
-# and TUI rebuilds. Probe the build trees directly instead: chown only
-# when the venv is not already owned by the runtime hermes UID. Idempotent
-# and skips the expensive recursive chown on every restart once ownership
-# is settled.
-venv_owner=$(stat -c %u "$INSTALL_DIR/.venv" 2>/dev/null || echo "")
-if [ -n "$venv_owner" ] && [ "$venv_owner" != "$actual_hermes_uid" ]; then
-    echo "[stage2] Fixing ownership of build trees under $INSTALL_DIR to hermes ($actual_hermes_uid)"
-    chown -R hermes:hermes \
-        "$INSTALL_DIR/.venv" \
-        "$INSTALL_DIR/ui-tui" \
-        "$INSTALL_DIR/gateway" \
-        "$INSTALL_DIR/node_modules" \
-        2>/dev/null || \
-        echo "[stage2] Warning: chown of build trees failed (rootless container?) — continuing"
-fi
+# Historically this did `chown -R hermes:hermes` over .venv, ui-tui,
+# gateway, and node_modules whenever .venv's owner differed from the runtime
+# UID. With HERMES_UID/HERMES_GID set to a host user (for example 1000:1000),
+# the first boot of every new container had to rewrite ownership on the full
+# Python + npm dependency trees, which can mean hundreds of thousands of
+# inodes before the gateway starts.
+#
+# New images make those trees group-writable at build time. After a GID remap,
+# the old build GID (usually 10000) no longer has a group name, so recreate or
+# reuse a group for that numeric GID and add hermes to it. That keeps all
+# existing files writable without walking the trees. If an image or filesystem
+# lacks the expected group-write bits, fall back to repairing directory owners
+# only: installs and cache writes need writable directories, while existing
+# files are already world-readable from the Dockerfile chmod.
+ensure_install_tree_group() {
+    tree_gid="$1"
+    [ -n "$tree_gid" ] || return 0
+    [ "$tree_gid" != "$actual_hermes_gid" ] || return 0
+
+    if id -G hermes 2>/dev/null | tr ' ' '\n' | grep -qx "$tree_gid"; then
+        return 0
+    fi
+
+    tree_group=$(getent group "$tree_gid" 2>/dev/null | cut -d: -f1)
+    if [ -z "$tree_group" ]; then
+        tree_group="hermesbuild"
+        if getent group "$tree_group" >/dev/null 2>&1; then
+            tree_group="hermesbuild$tree_gid"
+        fi
+        if ! groupadd -g "$tree_gid" "$tree_group" 2>/dev/null; then
+            echo "[stage2] Warning: groupadd -g $tree_gid $tree_group failed; falling back to targeted chown"
+            return 1
+        fi
+        echo "[stage2] Created group $tree_group (GID $tree_gid) for build-tree write access"
+    fi
+
+    if usermod -aG "$tree_group" hermes 2>/dev/null; then
+        echo "[stage2] Added hermes to group $tree_group (GID $tree_gid) for build-tree write access"
+    else
+        echo "[stage2] Warning: usermod -aG $tree_group hermes failed; falling back to targeted chown"
+        return 1
+    fi
+}
+
+repair_install_tree_writable_dirs() {
+    tree="$1"
+    [ -e "$tree" ] || return 0
+
+    if as_hermes test -w "$tree" 2>/dev/null; then
+        return 0
+    fi
+
+    echo "[stage2] Fixing writable directories under $tree to hermes ($actual_hermes_uid)"
+    if [ -d "$tree" ]; then
+        chown hermes:hermes "$tree" 2>/dev/null || {
+            echo "[stage2] Warning: chown $tree failed (rootless container?) — continuing"
+            return 0
+        }
+        find "$tree" -mindepth 1 -type d -exec chown hermes:hermes {} + 2>/dev/null || \
+            echo "[stage2] Warning: directory chown under $tree failed (rootless container?) — continuing"
+    else
+        chown hermes:hermes "$tree" 2>/dev/null || \
+            echo "[stage2] Warning: chown $tree failed (rootless container?) — continuing"
+    fi
+}
+
+for tree in "$INSTALL_DIR/.venv" "$INSTALL_DIR/ui-tui" "$INSTALL_DIR/gateway" "$INSTALL_DIR/node_modules"; do
+    tree_gid=$(stat -c %g "$tree" 2>/dev/null || echo "")
+    ensure_install_tree_group "$tree_gid" || true
+    repair_install_tree_writable_dirs "$tree"
+done
 
 # Always reset ownership of $HERMES_HOME/profiles to hermes on every
 # boot. Profile dirs and files can land owned by root when commands

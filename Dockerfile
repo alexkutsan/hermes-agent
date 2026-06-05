@@ -179,12 +179,12 @@ RUN cd web && npm run build && \
 
 # ---------- Permissions ----------
 # Make install dir world-readable so any HERMES_UID can read it at runtime.
-# The venv needs to be traversable too.
-# node_modules trees additionally need to be writable by the hermes user
-# so the runtime `npm install` triggered by _tui_need_npm_install() in
-# hermes_cli/main.py succeeds (see #18800). /opt/hermes/web is build-time
-# only (HERMES_WEB_DIST points at hermes_cli/web_dist) and is intentionally
-# not chowned here.
+# Runtime-mutable dependency/build trees are also group-writable. When
+# HERMES_UID/HERMES_GID remaps hermes away from the build UID/GID (10000), the
+# stage2 hook can grant hermes membership in the old build GID instead of
+# recursively chowning hundreds of thousands of .venv/node_modules files on
+# first boot. /opt/hermes/web is build-time only (HERMES_WEB_DIST points at
+# hermes_cli/web_dist) and is intentionally excluded here.
 # /opt/hermes/gateway is runtime-writable: Python may create __pycache__ and
 # gateway state artifacts beneath the package after services drop privileges,
 # especially when the hermes UID is remapped at boot (#27221).
@@ -194,6 +194,7 @@ RUN cd web && npm run build && \
 # fail to load.  See tools/lazy_deps.py.
 USER root
 RUN chmod -R a+rX /opt/hermes && \
+    chmod -R g+rwX /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/gateway /opt/hermes/node_modules && \
     chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/gateway /opt/hermes/node_modules
 # Start as root so the s6-overlay stage2 hook can usermod/groupmod and chown
 # the data volume. Each supervised service then drops to the hermes user via
