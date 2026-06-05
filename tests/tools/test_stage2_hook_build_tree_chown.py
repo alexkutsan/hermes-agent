@@ -1,4 +1,4 @@
-"""Contract test: the s6-overlay stage2 hook keeps build trees writable.
+"""Contract test: the s6-overlay stage2 hook repairs build-tree ownership.
 
 Regression guard for the HERMES_UID/PUID remap path broken by #35027.
 
@@ -10,11 +10,11 @@ already satisfied and the build-tree chown was silently skipped — leaving
   - lazy_deps.py `uv pip install` of platform extras (#15012, #21100)
   - the TUI esbuild rebuild into ui-tui/dist (#28851)
 
-The current fix avoids a startup-scale `chown -R` over the full .venv and
-node_modules trees. New Docker layers make those trees group-writable; stage2
-recreates the old build GID as a supplemental group for hermes after GID remap,
-then only falls back to directory-owner repair when the trees still are not
-writable.
+The current fix avoids an unconditional `chown -R` over the full .venv and
+node_modules trees. Stage2 scans each runtime-writable build tree for entries
+whose UID/GID does not match the runtime hermes user and chowns only those
+entries. Settled restarts still scan metadata, but they do not dirty every
+inode again.
 
 The extraction + stubbed-shell-run approach mirrors
 tests/tools/test_stage2_hook_toplevel_chown.py.
@@ -40,23 +40,25 @@ def stage2_text() -> str:
     return STAGE2_HOOK.read_text()
 
 
-def _build_tree_repair_block(text: str) -> str:
-    """Extract the build-tree repair block."""
+def _build_tree_chown_block(text: str) -> str:
+    """Extract the build-tree targeted chown block."""
     m = re.search(
-        r"(ensure_install_tree_group\(\) \{\n(?:.*\n)*?^done)",
+        r"(repair_install_tree_owners\(\) \{\n(?:.*\n)*?^done)",
         text,
         flags=re.MULTILINE,
     )
-    assert m, "stage2-hook.sh must contain the build-tree writability repair block"
+    assert m, "stage2-hook.sh must contain the build-tree targeted chown block"
     return m.group(1)
 
 
-def test_build_tree_repair_not_gated_on_hermes_home(stage2_text: str) -> None:
-    """The build-tree repair must NOT live inside the `if [ "$needs_chown" = true ]`
+def test_build_tree_chown_not_gated_on_hermes_home(stage2_text: str) -> None:
+    """The build-tree chown must NOT live inside the `if [ "$needs_chown" = true ]`
     block keyed on $HERMES_HOME ownership — that is exactly the #35027 bug."""
-    block = _build_tree_repair_block(stage2_text)
+    block = _build_tree_chown_block(stage2_text)
     assert "$HERMES_HOME" not in block
-    assert "as_hermes test -w" in block
+    assert 'find "$tree"' in block
+    assert '! -uid "$actual_hermes_uid"' in block
+    assert '! -gid "$actual_hermes_gid"' in block
     # All runtime-writable build trees are covered independently.
     for tree in (
         "$INSTALL_DIR/.venv",
@@ -64,23 +66,22 @@ def test_build_tree_repair_not_gated_on_hermes_home(stage2_text: str) -> None:
         "$INSTALL_DIR/gateway",
         "$INSTALL_DIR/node_modules",
     ):
-        assert tree in block, f"build-tree repair must cover {tree}"
+        assert tree in block, f"build-tree chown must cover {tree}"
     assert "chown -R hermes:hermes" not in block
 
 
-def _run_build_tree_repair_block(
+def _run_build_tree_chown_block(
     text: str,
     *,
-    tree_gid: int,
     hermes_uid: int = 4242,
     hermes_gid: int = 4243,
-    writable_as_hermes: bool,
+    mismatch: bool,
 ) -> list[str]:
     """Run the extracted block with external commands stubbed."""
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash not available")
-    block = _build_tree_repair_block(text)
+    block = _build_tree_chown_block(text)
 
     with tempfile.TemporaryDirectory() as d:
         dpath = Path(d)
@@ -89,27 +90,25 @@ def _run_build_tree_repair_block(
         for rel in (".venv", "ui-tui", "gateway", "node_modules"):
             (install_dir / rel).mkdir(parents=True)
 
-        writable = "0" if writable_as_hermes else "1"
+        mismatch_output = f"{install_dir}/.venv/bad"
         script = (
             "set -eu\n"
             f'INSTALL_DIR="{install_dir}"\n'
             f'actual_hermes_uid={hermes_uid}\n'
             f'actual_hermes_gid={hermes_gid}\n'
-            "stat() { echo "
-            f"{tree_gid}"
-            "; }\n"
-            "id() {\n"
-            "  if [ \"$1\" = \"-G\" ]; then echo \"4243\"; return 0; fi\n"
-            "  if [ \"$1\" = \"-g\" ]; then echo \"$actual_hermes_gid\"; return 0; fi\n"
-            "  if [ \"$1\" = \"-u\" ]; then echo \"$actual_hermes_uid\"; return 0; fi\n"
-            "  return 1\n"
+            "stat() { echo \"$actual_hermes_uid:$actual_hermes_gid\"; }\n"
+            "find() {\n"
+            "  case \" $* \" in\n"
+            "    *\" -print -quit \"*)\n"
+            f"      {'echo ' + mismatch_output if mismatch else 'return 0'}\n"
+            "      ;;\n"
+            "    *\" -exec chown -h hermes:hermes {} + \"*)\n"
+            f'      echo "targeted-find-chown $*" >> "{log}"\n'
+            "      ;;\n"
+            "    *) return 1 ;;\n"
+            "  esac\n"
             "}\n"
-            "getent() { return 2; }\n"
-            f'groupadd() {{ echo "groupadd $*" >> "{log}"; }}\n'
-            f'usermod() {{ echo "usermod $*" >> "{log}"; }}\n'
-            f'chown() {{ echo "chown $*" >> "{log}"; }}\n'
-            f'find() {{ echo "find $*" >> "{log}"; }}\n'
-            f'as_hermes() {{ return {writable}; }}\n'
+            f'chown() {{ echo "direct-chown $*" >> "{log}"; }}\n'
             + block
         )
         script_path = dpath / "harness.sh"
@@ -119,44 +118,31 @@ def _run_build_tree_repair_block(
         return log.read_text().splitlines() if log.exists() else []
 
 
-def test_build_gid_group_is_granted_when_tree_gid_differs(stage2_text: str) -> None:
+def test_targeted_chown_fires_when_entries_differ(stage2_text: str) -> None:
     """The #35027 regression scenario: after a remap $HERMES_HOME already
-    matches the new UID, but install trees still carry the build-time GID
-    (10000). Stage2 must grant hermes that GID independently of $HERMES_HOME."""
-    lines = _run_build_tree_repair_block(
+    matches the new UID, but install-tree entries still carry the build-time
+    UID/GID (10000). Stage2 must repair them independently of $HERMES_HOME."""
+    lines = _run_build_tree_chown_block(
         stage2_text,
-        tree_gid=10000,
-        hermes_gid=4243,
-        writable_as_hermes=True,
+        mismatch=True,
     )
-    assert any(line == "groupadd -g 10000 hermesbuild" for line in lines)
-    assert any(line == "usermod -aG hermesbuild hermes" for line in lines)
-    assert not any(line.startswith("chown ") for line in lines), (
-        "group-writable build trees should not need startup chown"
+    assert any(line.startswith("targeted-find-chown ") for line in lines), (
+        "build-tree chown must use find to repair mismatched entries"
     )
+    assert not any("chown -R" in line for line in lines)
 
 
-def test_directory_chown_fallback_when_group_write_is_insufficient(stage2_text: str) -> None:
-    """If group membership does not make a tree writable, repair directories
-    rather than recursively chowning every dependency file."""
-    lines = _run_build_tree_repair_block(
+def test_chown_skipped_when_no_mismatched_entries(stage2_text: str) -> None:
+    """Idempotency: once entries are hermes-owned, no chown commands run on
+    subsequent boots."""
+    lines = _run_build_tree_chown_block(
         stage2_text,
-        tree_gid=10000,
-        hermes_gid=4243,
-        writable_as_hermes=False,
+        mismatch=False,
     )
-    assert any(line.startswith("chown hermes:hermes ") for line in lines)
-    assert any(" -type d " in f" {line} " for line in lines)
-    assert not any(line.startswith("chown -R ") for line in lines)
+    assert not lines
 
 
-def test_group_grant_skipped_when_tree_gid_already_matches(stage2_text: str) -> None:
-    """No remap: tree GID and hermes GID already match."""
-    lines = _run_build_tree_repair_block(
-        stage2_text,
-        tree_gid=10000,
-        hermes_gid=10000,
-        writable_as_hermes=True,
-    )
-    assert not any(line.startswith(("groupadd ", "usermod ", "chown ", "find ")) for line in lines)
+def test_targeted_chown_uses_symlink_safe_chown(stage2_text: str) -> None:
+    block = _build_tree_chown_block(stage2_text)
+    assert "-exec chown -h hermes:hermes {} +" in block
 

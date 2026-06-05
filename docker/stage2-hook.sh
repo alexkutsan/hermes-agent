@@ -208,9 +208,9 @@ if [ "$needs_chown" = true ]; then
     done
 fi
 
-# --- Ensure build trees under $INSTALL_DIR stay writable after UID/GID remap ---
-# Runtime-writable trees under $INSTALL_DIR must remain writable after the
-# hermes UID/GID is remapped, otherwise:
+# --- Fix ownership of build trees under $INSTALL_DIR ---
+# Runtime-writable trees under $INSTALL_DIR must be owned by the runtime
+# hermes UID/GID after remap, otherwise:
 #   - .venv: lazy_deps.py cannot install platform packages (discord.py,
 #     telegram, slack, etc.) with EACCES (#15012, #21100)
 #   - ui-tui: local/non-packaged TUI launches may rebuild dist/entry.js
@@ -228,69 +228,32 @@ fi
 # Python + npm dependency trees, which can mean hundreds of thousands of
 # inodes before the gateway starts.
 #
-# New images make those trees group-writable at build time. After a GID remap,
-# the old build GID (usually 10000) no longer has a group name, so recreate or
-# reuse a group for that numeric GID and add hermes to it. That keeps all
-# existing files writable without walking the trees. If an image or filesystem
-# lacks the expected group-write bits, fall back to repairing directory owners
-# only: installs and cache writes need writable directories, while existing
-# files are already world-readable from the Dockerfile chmod.
-ensure_install_tree_group() {
-    tree_gid="$1"
-    [ -n "$tree_gid" ] || return 0
-    [ "$tree_gid" != "$actual_hermes_gid" ] || return 0
-
-    if id -G hermes 2>/dev/null | tr ' ' '\n' | grep -qx "$tree_gid"; then
-        return 0
-    fi
-
-    tree_group=$(getent group "$tree_gid" 2>/dev/null | cut -d: -f1)
-    if [ -z "$tree_group" ]; then
-        tree_group="hermesbuild"
-        if getent group "$tree_group" >/dev/null 2>&1; then
-            tree_group="hermesbuild$tree_gid"
-        fi
-        if ! groupadd -g "$tree_gid" "$tree_group" 2>/dev/null; then
-            echo "[stage2] Warning: groupadd -g $tree_gid $tree_group failed; falling back to targeted chown"
-            return 1
-        fi
-        echo "[stage2] Created group $tree_group (GID $tree_gid) for build-tree write access"
-    fi
-
-    if usermod -aG "$tree_group" hermes 2>/dev/null; then
-        echo "[stage2] Added hermes to group $tree_group (GID $tree_gid) for build-tree write access"
-    else
-        echo "[stage2] Warning: usermod -aG $tree_group hermes failed; falling back to targeted chown"
-        return 1
-    fi
-}
-
-repair_install_tree_writable_dirs() {
+# Keep strict ownership, but avoid rewriting entries that are already correct:
+# `find` still has to scan metadata, but settled restarts do not dirty every
+# inode again. This also repairs partial drift under any individual tree,
+# unlike the old single `.venv` owner gate.
+repair_install_tree_owners() {
     tree="$1"
     [ -e "$tree" ] || return 0
 
-    if as_hermes test -w "$tree" 2>/dev/null; then
-        return 0
-    fi
-
-    echo "[stage2] Fixing writable directories under $tree to hermes ($actual_hermes_uid)"
     if [ -d "$tree" ]; then
-        chown hermes:hermes "$tree" 2>/dev/null || {
-            echo "[stage2] Warning: chown $tree failed (rootless container?) — continuing"
-            return 0
-        }
-        find "$tree" -mindepth 1 -type d -exec chown hermes:hermes {} + 2>/dev/null || \
-            echo "[stage2] Warning: directory chown under $tree failed (rootless container?) — continuing"
+        first_mismatch=$(find "$tree" \( ! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid" \) -print -quit 2>/dev/null || true)
+        [ -n "$first_mismatch" ] || return 0
+
+        echo "[stage2] Fixing ownership of mismatched entries under $tree to hermes ($actual_hermes_uid:$actual_hermes_gid)"
+        find "$tree" \( ! -uid "$actual_hermes_uid" -o ! -gid "$actual_hermes_gid" \) \
+            -exec chown -h hermes:hermes {} + 2>/dev/null || \
+            echo "[stage2] Warning: targeted chown under $tree failed (rootless container?) — continuing"
     else
-        chown hermes:hermes "$tree" 2>/dev/null || \
+        tree_owner_group=$(stat -c '%u:%g' "$tree" 2>/dev/null || echo "")
+        [ "$tree_owner_group" != "$actual_hermes_uid:$actual_hermes_gid" ] || return 0
+        chown -h hermes:hermes "$tree" 2>/dev/null || \
             echo "[stage2] Warning: chown $tree failed (rootless container?) — continuing"
     fi
 }
 
 for tree in "$INSTALL_DIR/.venv" "$INSTALL_DIR/ui-tui" "$INSTALL_DIR/gateway" "$INSTALL_DIR/node_modules"; do
-    tree_gid=$(stat -c %g "$tree" 2>/dev/null || echo "")
-    ensure_install_tree_group "$tree_gid" || true
-    repair_install_tree_writable_dirs "$tree"
+    repair_install_tree_owners "$tree"
 done
 
 # Always reset ownership of $HERMES_HOME/profiles to hermes on every
