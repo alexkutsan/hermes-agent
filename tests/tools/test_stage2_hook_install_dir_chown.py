@@ -28,12 +28,9 @@ def stage2_text() -> str:
 
 def _install_dir_chown_block(text: str) -> str:
     match = re.search(
-        r"(chown -R hermes:hermes \\\n"
-        r"(?:\s+\"\$INSTALL_DIR/[^\"]+\" \\\n)+"
-        r"\s+2>/dev/null \|\| \\\n"
-        r"\s+echo \"\[stage2\] Warning: chown of build trees failed.*?\")",
+        r"(repair_install_tree_owners\(\) \{\n(?:.*\n)*?^done)",
         text,
-        flags=re.DOTALL,
+        flags=re.MULTILINE,
     )
     assert match, "stage2-hook.sh must repair ownership of runtime-writable install trees"
     return match.group(1)
@@ -42,9 +39,10 @@ def _install_dir_chown_block(text: str) -> str:
 def test_uid_remap_chowns_runtime_writable_gateway_tree(stage2_text: str) -> None:
     block = _install_dir_chown_block(stage2_text)
     assert '"$INSTALL_DIR/gateway"' in block, (
-        "the build-tree ownership repair must chown $INSTALL_DIR/gateway so the "
-        "gateway runtime can write Python cache artifacts after a UID remap (#27221)"
+        "the build-tree ownership repair must cover $INSTALL_DIR/gateway so the "
+        "runtime can write Python cache artifacts after a UID remap (#27221)"
     )
+    assert "-exec chown -h hermes:hermes {} +" in block
 
 
 def test_install_dir_chown_keeps_existing_runtime_writable_trees(stage2_text: str) -> None:
